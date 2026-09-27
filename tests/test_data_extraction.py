@@ -10,18 +10,20 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "data"))
 
-from vllm_predictor.data_extraction import (  # noqa: E402
+from extract_forelen import (  # noqa: E402
     CSV_FIELDS,
+    ExtractedSample,
     ExtractionConfig,
     ResultStore,
     Sample,
+    ShardWriter,
     chat_payload,
+    extract_last_token_hidden_states,
     iter_csv_samples,
     per_sample_seed,
     process_sample,
-    save_last_token_hidden_states,
 )
 
 
@@ -55,23 +57,17 @@ def test_iter_csv_samples_uses_only_prompt_column(tmp_path: Path) -> None:
     assert samples[0].sample_id != samples[1].sample_id
 
 
-def test_save_last_token_preserves_token_dimension(tmp_path: Path) -> None:
+def test_extract_last_token_removes_only_token_dimension(tmp_path: Path) -> None:
     source = tmp_path / "full.safetensors"
-    destination = tmp_path / "compact" / "last.safetensors"
     token_ids = torch.tensor([11, 12, 13])
     hidden_states = torch.arange(24, dtype=torch.float32).reshape(3, 2, 4)
     save_file({"token_ids": token_ids, "hidden_states": hidden_states}, source)
 
-    metadata = save_last_token_hidden_states(source, destination)
+    last_hidden_states, metadata = extract_last_token_hidden_states(source)
 
-    assert metadata["source_hidden_states_shape"] == [3, 2, 4]
-    assert metadata["hidden_states_shape"] == [1, 2, 4]
+    assert metadata["hidden_states_shape"] == [2, 4]
     assert metadata["last_prompt_token_id"] == 13
-    with safe_open(destination, framework="pt", device="cpu") as tensors:
-        assert torch.equal(tensors.get_tensor("token_ids"), token_ids[-1:])
-        assert torch.equal(
-            tensors.get_tensor("hidden_states"), hidden_states[-1:]
-        )
+    assert torch.equal(last_hidden_states, hidden_states[-1])
 
 
 def test_rl_sampling_payload_is_not_greedy() -> None:
@@ -87,12 +83,14 @@ def test_rl_sampling_payload_is_not_greedy() -> None:
         frequency_penalty=0.0,
         repetition_penalty=1.0,
         seed=None,
+        request_hidden_states=False,
     )
 
     assert payload["temperature"] > 0
     assert payload["top_p"] == 0.95
     assert payload["top_k"] == 20
     assert "seed" not in payload
+    assert "kv_transfer_params" not in payload
 
 
 def test_per_sample_seed_is_reproducible_but_distinct() -> None:
@@ -105,23 +103,32 @@ def test_per_sample_seed_is_reproducible_but_distinct() -> None:
 def test_result_store_repairs_csv_from_completed_manifest(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.jsonl"
     results = tmp_path / "samples.csv"
-    completed = {field: "" for field in CSV_FIELDS}
-    completed.update(
+    shard = tmp_path / "shard.safetensors"
+    save_file(
         {
-            "sample_id": "sample-1",
-            "status": "completed",
-            "hidden_states_shape": [1, 1, 4],
-            "completion_tokens": 42,
-        }
+            "hidden_states": torch.zeros(1, 4),
+            "completion_tokens": torch.tensor([42], dtype=torch.int32),
+        },
+        shard,
     )
+    completed = {
+        "sample_id": "sample-1",
+        "status": "completed",
+        "hidden_states_path": str(shard),
+        "hidden_states_row": 0,
+        "completion_tokens": 42,
+    }
     manifest.write_text(json.dumps(completed) + "\n", encoding="utf-8")
 
     ResultStore(manifest, results)
 
     with results.open("r", encoding="utf-8", newline="") as input_file:
-        rows = list(csv.DictReader(input_file))
+        reader = csv.DictReader(input_file)
+        rows = list(reader)
+    assert tuple(reader.fieldnames or ()) == CSV_FIELDS
     assert len(rows) == 1
-    assert rows[0]["sample_id"] == "sample-1"
+    assert rows[0]["hidden_states_path"] == completed["hidden_states_path"]
+    assert rows[0]["hidden_states_row"] == "0"
     assert rows[0]["completion_tokens"] == "42"
 
 
@@ -133,22 +140,60 @@ def test_completed_record_is_not_resumable_when_feature_is_missing(
         "sample_id": "sample-missing",
         "status": "completed",
         "hidden_states_path": str(tmp_path / "missing.safetensors"),
+        "hidden_states_row": 0,
+        "completion_tokens": 42,
     }
     manifest.write_text(json.dumps(completed) + "\n", encoding="utf-8")
     store = ResultStore(manifest, tmp_path / "samples.csv")
 
-    assert store.resumable_hidden_record("sample-missing") is None
+    assert not store.is_materialized(completed)
 
 
-def test_process_sample_is_resumable_and_deletes_full_files(tmp_path: Path) -> None:
+def test_shard_writer_batches_samples_and_flushes_partial_shard(
+    tmp_path: Path,
+) -> None:
+    store = ResultStore(tmp_path / "manifest.jsonl", tmp_path / "samples.csv")
+    writer = ShardWriter(tmp_path / "output", shard_size=2, store=store)
+
+    def extracted(index: int) -> ExtractedSample:
+        return ExtractedSample(
+            record={
+                "sample_id": f"sample-{index}",
+                "source_file": "train.csv",
+                "row_index": index,
+                "completion_tokens": 10 + index,
+                "finish_reason": "stop",
+                "truncated": False,
+            },
+            hidden_states=torch.full((4,), float(index)),
+        )
+
+    assert writer.add(extracted(0)) == []
+    first_records = writer.add(extracted(1))
+    assert [record["hidden_states_row"] for record in first_records] == [0, 1]
+    assert writer.add(extracted(2)) == []
+    final_records = writer.flush()
+
+    shard_files = sorted((tmp_path / "output" / "shards").glob("*.safetensors"))
+    assert len(shard_files) == 2
+    assert final_records[0]["hidden_states_row"] == 0
+    with safe_open(shard_files[0], framework="pt", device="cpu") as tensors:
+        assert tensors.get_tensor("hidden_states").shape == (2, 4)
+        assert tensors.get_tensor("completion_tokens").tolist() == [10, 11]
+    with safe_open(shard_files[1], framework="pt", device="cpu") as tensors:
+        assert tensors.get_tensor("hidden_states").shape == (1, 4)
+        assert tensors.get_tensor("completion_tokens").tolist() == [12]
+
+
+def test_process_sample_deletes_full_files_and_commits_shard(tmp_path: Path) -> None:
     prefill_file = tmp_path / "server-prefill.safetensors"
     generation_file = tmp_path / "server-generation.safetensors"
-    tensors = {
+    source_tensors = {
         "token_ids": torch.tensor([21, 22]),
         "hidden_states": torch.arange(16, dtype=torch.float32).reshape(2, 1, 8),
     }
-    save_file(tensors, prefill_file)
-    save_file(tensors, generation_file)
+    save_file(source_tensors, prefill_file)
+    save_file(source_tensors, generation_file)
     responses = iter(
         [
             {
@@ -175,7 +220,6 @@ def test_process_sample_is_resumable_and_deletes_full_files(tmp_path: Path) -> N
         source_file="train.csv",
         row_index=0,
         prompt="hello",
-        prompt_sha256="digest",
     )
     store = ResultStore(tmp_path / "manifest.jsonl", tmp_path / "samples.csv")
     config = ExtractionConfig(
@@ -185,16 +229,41 @@ def test_process_sample_is_resumable_and_deletes_full_files(tmp_path: Path) -> N
         output_dir=tmp_path / "output",
     )
 
-    completed = process_sample(sample, config, store, request_fn=fake_request)
-    skipped = process_sample(sample, config, store, request_fn=fake_request)
+    extracted = process_sample(sample, config, request_fn=fake_request)
 
-    assert completed["status"] == "completed"
-    assert completed["completion_tokens"] == 17
-    assert skipped["status"] == "skipped"
+    assert isinstance(extracted, ExtractedSample)
+    assert extracted.record["completion_tokens"] == 17
     assert request_count == 2
     assert not prefill_file.exists()
     assert not generation_file.exists()
-    assert Path(completed["hidden_states_path"]).is_file()
-    statuses = [record["status"] for record in store.history[sample.sample_id]]
-    assert statuses == ["hidden_saved", "completed"]
+    writer = ShardWriter(config.output_dir, shard_size=1, store=store)
+    records = writer.add(extracted)
+    assert len(records) == 1
+    completed = records[0]
+    shard_path = Path(completed["hidden_states_path"])
+    assert shard_path.is_file()
+    assert completed["hidden_states_row"] == 0
+    assert list(store.history) == [sample.sample_id]
+    assert all(
+        "user_prompt_content" not in record
+        for record in store.history[sample.sample_id]
+    )
+    with safe_open(shard_path, framework="pt", device="cpu") as tensors:
+        assert torch.equal(
+            tensors.get_tensor("hidden_states"),
+            source_tensors["hidden_states"][-1].unsqueeze(0),
+        )
+        assert tensors.get_tensor("hidden_states").shape == (1, 1, 8)
+        assert tensors.get_tensor("completion_tokens").tolist() == [17]
+    with store.results_path.open("r", encoding="utf-8", newline="") as input_file:
+        reader = csv.DictReader(input_file)
+        rows = list(reader)
+    assert tuple(reader.fieldnames or ()) == CSV_FIELDS
+    assert rows == [
+        {
+            "hidden_states_path": completed["hidden_states_path"],
+            "hidden_states_row": "0",
+            "completion_tokens": "17",
+        }
+    ]
 
