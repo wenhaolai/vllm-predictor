@@ -32,8 +32,8 @@ def post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--model", default="qwen3.6")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8001")
+    parser.add_argument("--model", default="qwen3.6-27b")
     parser.add_argument("--prompt", default="请解释什么是投机解码。")
     parser.add_argument(
         "--manifest",
