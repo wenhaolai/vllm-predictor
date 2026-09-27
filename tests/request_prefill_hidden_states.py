@@ -39,7 +39,7 @@ def main() -> int:
         "--manifest",
         default=os.environ.get(
             "HIDDEN_STATES_MANIFEST",
-            "/outputs/hidden_states/manifest.jsonl",
+            "/home/laiwenhao/vllm-predictor/outputs/hidden_states/manifest.jsonl",
         ),
     )
     args = parser.parse_args()

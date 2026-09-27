@@ -5,11 +5,12 @@ set -euo pipefail
 # Defaults are deliberately conservative for four 32 GiB Ascend 910B4 NPUs.
 # Every request writes one safetensors file under OUTPUT_DIR.
 
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.6-27B}"
+MODEL_PATH="${MODEL_PATH:-}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3.6}"
 SERVICE_HOST="${SERVICE_HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
-OUTPUT_DIR="${OUTPUT_DIR:-/outputs/hidden_states}"
+PROJECT_DIR="${PROJECT_DIR:-/home/laiwenhao/vllm-predictor}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/outputs/hidden_states}"
 
 TP_SIZE="${TP_SIZE:-4}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
@@ -28,6 +29,12 @@ export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-512}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-false}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-1}"
+
+if [[ -z "${MODEL_PATH}" ]]; then
+    echo "ERROR: MODEL_PATH must point to the Qwen3.6-27B weights inside the container." >&2
+    echo "Example: MODEL_PATH=/path/to/Qwen3.6-27B bash $0" >&2
+    exit 1
+fi
 
 mkdir -p "${OUTPUT_DIR}"
 if [[ ! -w "${OUTPUT_DIR}" ]]; then
