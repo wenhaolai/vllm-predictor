@@ -188,12 +188,16 @@ def test_shard_writer_batches_samples_and_flushes_partial_shard(
 def test_process_sample_deletes_full_files_and_commits_shard(tmp_path: Path) -> None:
     prefill_file = tmp_path / "server-prefill.safetensors"
     generation_file = tmp_path / "server-generation.safetensors"
+    prefill_lock = Path(f"{prefill_file}.lock")
+    generation_lock = Path(f"{generation_file}.lock")
     source_tensors = {
         "token_ids": torch.tensor([21, 22]),
         "hidden_states": torch.arange(16, dtype=torch.float32).reshape(2, 1, 8),
     }
     save_file(source_tensors, prefill_file)
     save_file(source_tensors, generation_file)
+    prefill_lock.touch()
+    generation_lock.touch()
     responses = iter(
         [
             {
@@ -236,6 +240,8 @@ def test_process_sample_deletes_full_files_and_commits_shard(tmp_path: Path) -> 
     assert request_count == 2
     assert not prefill_file.exists()
     assert not generation_file.exists()
+    assert not prefill_lock.exists()
+    assert not generation_lock.exists()
     writer = ShardWriter(config.output_dir, shard_size=1, store=store)
     records = writer.add(extracted)
     assert len(records) == 1

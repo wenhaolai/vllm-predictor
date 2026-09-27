@@ -14,7 +14,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -260,18 +259,18 @@ def extract_last_token_hidden_states(source: Path) -> tuple[Any, dict[str, Any]]
     return last_hidden_states, metadata
 
 
-def _delete_server_file(path: Path, wait_seconds: float = 30.0) -> bool:
-    """Delete one exact server-returned file after its data has been consumed."""
+def _delete_server_file(path: Path) -> bool:
+    """Delete one consumed hidden-state file and its synchronization lock."""
 
-    deadline = time.monotonic() + wait_seconds
-    while True:
+    removed = False
+    lock_path = Path(f"{path}.lock")
+    for candidate in (lock_path, path):
         try:
-            path.unlink()
-            return True
+            candidate.unlink()
+            removed = True
         except FileNotFoundError:
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(0.05)
+            pass
+    return removed
 
 
 def _completion_metadata(response: Mapping[str, Any]) -> tuple[int, str | None]:
@@ -711,12 +710,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-backoff", type=float, default=2.0)
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Concurrent samples. Start with 1, then increase after validation.",
-    )
-    parser.add_argument(
         "--shard-size",
         type=int,
         default=2048,
@@ -739,8 +732,6 @@ def parse_args() -> argparse.Namespace:
         help="Stop after the first failed sample instead of recording and continuing.",
     )
     args = parser.parse_args()
-    if args.workers < 1:
-        parser.error("--workers must be at least 1")
     if args.shard_size < 1:
         parser.error("--shard-size must be at least 1")
     if args.max_tokens < 1:
@@ -830,37 +821,18 @@ def main() -> int:
 
     counters: dict[str, int] = {"processed": 0}
     failure_count = 0
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        pending: set[Future[ExtractedSample | dict[str, Any]]] = set()
-        exhausted = False
-        stop_early = False
-        while (pending or not exhausted) and not stop_early:
-            while not exhausted and len(pending) < args.workers * 2:
-                try:
-                    sample = next(samples)
-                except StopIteration:
-                    exhausted = True
-                    break
-                pending.add(executor.submit(process_sample, sample, config))
-            if not pending:
-                continue
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                result = future.result()
-                counters["processed"] += 1
-                if isinstance(result, ExtractedSample):
-                    report_committed(shard_writer.add(result), counters)
-                    continue
+    for sample in samples:
+        result = process_sample(sample, config)
+        counters["processed"] += 1
+        if isinstance(result, ExtractedSample):
+            report_committed(shard_writer.add(result), counters)
+            continue
 
-                store.append_manifest(result)
-                report(result, counters)
-                if result["status"] != "completed":
-                    failure_count += 1
-                    if args.fail_fast:
-                        for outstanding in pending:
-                            outstanding.cancel()
-                        stop_early = True
-                        break
+        store.append_manifest(result)
+        report(result, counters)
+        failure_count += 1
+        if args.fail_fast:
+            break
 
     report_committed(shard_writer.flush(), counters)
 
