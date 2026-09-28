@@ -11,13 +11,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import logging
 import os
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
+
+LOGGER = logging.getLogger("extract_forelen")
 
 CSV_FIELDS = (
     "source_file",
@@ -26,6 +30,18 @@ CSV_FIELDS = (
     "hidden_states_row",
     "completion_tokens",
 )
+
+
+def configure_logging() -> None:
+    """Emit timestamped logs that can be captured by ``tee``."""
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -213,6 +229,26 @@ def create_local_llm(args: argparse.Namespace) -> tuple[Any, Any]:
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = args.devices
     args.hidden_states_dir.mkdir(parents=True, exist_ok=True)
 
+    LOGGER.info(
+        "Initializing local LLM: model=%s devices=%s tp=%d block_size=%d "
+        "max_model_len=%d gpu_memory_utilization=%.2f batch_size=%d",
+        args.model,
+        args.devices,
+        args.tensor_parallel_size,
+        args.block_size,
+        args.max_model_len,
+        args.gpu_memory_utilization,
+        args.batch_size,
+    )
+    LOGGER.info(
+        "Hidden-state extraction: layers=%s chunked_prefill=%s "
+        "prefix_caching=%s connector_dir=%s",
+        args.hidden_layer_ids,
+        args.enable_chunked_prefill,
+        args.enable_prefix_caching,
+        args.hidden_states_dir.resolve(),
+    )
+
     # Import only after ASCEND_RT_VISIBLE_DEVICES is fixed.
     from vllm import LLM, SamplingParams
 
@@ -255,6 +291,20 @@ def create_local_llm(args: argparse.Namespace) -> tuple[Any, Any]:
         frequency_penalty=args.frequency_penalty,
         repetition_penalty=args.repetition_penalty,
         seed=args.seed,
+    )
+    LOGGER.info(
+        "Sampling parameters: max_tokens=%d temperature=%s top_p=%s "
+        "top_k=%d min_p=%s presence_penalty=%s frequency_penalty=%s "
+        "repetition_penalty=%s seed=%s",
+        args.max_tokens,
+        args.temperature,
+        args.top_p,
+        args.top_k,
+        args.min_p,
+        args.presence_penalty,
+        args.frequency_penalty,
+        args.repetition_penalty,
+        args.seed,
     )
     return llm, sampling_params
 
@@ -323,6 +373,15 @@ def process_batch(
 ) -> tuple[list[Any], list[GenerationResult]]:
     """Generate once, then collect prompt states and generated lengths."""
 
+    first_row = samples[0].source_row
+    last_row = samples[-1].source_row
+    LOGGER.info(
+        "Starting batch: size=%d source_rows=%d..%d",
+        len(samples),
+        first_row,
+        last_row,
+    )
+    started_at = time.perf_counter()
     outputs = llm.generate(
         [sample.prompt for sample in samples],
         sampling_params,
@@ -332,6 +391,12 @@ def process_batch(
         raise RuntimeError(
             f"Local LLM returned {len(outputs)} outputs for {len(samples)} prompts"
         )
+    generation_seconds = time.perf_counter() - started_at
+    LOGGER.info(
+        "Generation completed: size=%d elapsed=%.3fs",
+        len(samples),
+        generation_seconds,
+    )
 
     paths: list[Path] = []
     try:
@@ -339,6 +404,16 @@ def process_batch(
             paths.append(output_hidden_states_path(output))
         hidden_states = [extract_last_token_hidden_states(path) for path in paths]
         generation_results = [generation_result(output) for output in outputs]
+        lengths = [result.completion_tokens for result in generation_results]
+        LOGGER.info(
+            "Batch extracted: hidden_state_shape=%s generated_tokens="
+            "min=%d avg=%.2f max=%d total=%d",
+            tuple(hidden_states[0].shape),
+            min(lengths),
+            sum(lengths) / len(lengths),
+            max(lengths),
+            sum(lengths),
+        )
         return hidden_states, generation_results
     finally:
         for path in paths:
@@ -493,6 +568,8 @@ def count_pending_samples(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    configure_logging()
+    run_started_at = time.perf_counter()
     args = parse_args(argv)
     input_file = args.input_file.resolve()
     if not input_file.is_file():
@@ -510,13 +587,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.limit,
     )
     if pending_count == 0:
-        print(f"No unfinished rows in {input_file}")
+        LOGGER.info("No unfinished rows: input=%s", input_file)
         return 0
 
     from tqdm import tqdm
 
-    print(f"Loading local model on Ascend devices {args.devices}")
+    LOGGER.info(
+        "Dataset ready: input=%s prompt_column=%s completed=%d pending=%d "
+        "output_dir=%s shard_size=%d",
+        input_file,
+        args.prompt_column,
+        len(completed_rows),
+        pending_count,
+        output_dir,
+        args.shard_size,
+    )
+    model_started_at = time.perf_counter()
     llm, sampling_params = create_local_llm(args)
+    LOGGER.info(
+        "Local LLM initialized: elapsed=%.3fs",
+        time.perf_counter() - model_started_at,
+    )
     shard_index = next_shard_index(output_dir)
     samples = pending_samples(
         input_file,
@@ -531,6 +622,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         desc=input_file.name,
     ) as progress:
         for shard_samples in batched(samples, args.shard_size):
+            LOGGER.info(
+                "Starting shard: index=%d samples=%d",
+                shard_index,
+                len(shard_samples),
+            )
+            shard_started_at = time.perf_counter()
             shard_hidden_states: list[Any] = []
             shard_generation_results: list[GenerationResult] = []
             for request_batch in batched(shard_samples, args.batch_size):
@@ -556,9 +653,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 shard_generation_results,
             )
             progress.set_postfix_str(shard_path.name)
+            LOGGER.info(
+                "Shard saved: index=%d samples=%d path=%s elapsed=%.3fs",
+                shard_index,
+                len(shard_samples),
+                shard_path,
+                time.perf_counter() - shard_started_at,
+            )
             shard_index += 1
 
-    print(f"Results: {results_path}")
+    LOGGER.info(
+        "Extraction completed: samples=%d results=%s elapsed=%.3fs",
+        pending_count,
+        results_path,
+        time.perf_counter() - run_started_at,
+    )
     return 0
 
 
@@ -566,5 +675,8 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        print("Interrupted", file=sys.stderr)
+        LOGGER.warning("Interrupted by user")
         raise SystemExit(130) from None
+    except Exception:
+        LOGGER.exception("Extraction failed")
+        raise
