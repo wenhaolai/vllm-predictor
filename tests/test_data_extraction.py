@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import argparse
 import csv
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import torch
 from safetensors import safe_open
@@ -20,36 +17,13 @@ from extract_forelen import (  # noqa: E402
     GenerationResult,
     Sample,
     append_results,
+    create_local_llm,
     extract_last_token_hidden_states,
-    generation_payload,
     iter_csv_samples,
-    offline_hidden_states,
     parse_args,
     process_batch,
     write_shard,
 )
-
-
-def make_args(**overrides):
-    values = {
-        "url": "http://generation:8000",
-        "model": "/models/qwen",
-        "server_model": "qwen",
-        "max_tokens": 2048,
-        "temperature": 0.6,
-        "top_p": 0.95,
-        "top_k": 20,
-        "min_p": 0.0,
-        "presence_penalty": 0.0,
-        "frequency_penalty": 0.0,
-        "repetition_penalty": 1.0,
-        "seed": None,
-        "timeout": 30.0,
-        "retries": 0,
-        "retry_backoff": 0.0,
-    }
-    values.update(overrides)
-    return argparse.Namespace(**values)
 
 
 def test_parse_args_has_requested_batch_and_shard_defaults(tmp_path: Path) -> None:
@@ -57,8 +31,6 @@ def test_parse_args_has_requested_batch_and_shard_defaults(tmp_path: Path) -> No
         [
             "--input-file",
             str(tmp_path / "forelen.csv"),
-            "--url",
-            "http://127.0.0.1:8000",
             "--model",
             "/models/qwen",
         ]
@@ -66,8 +38,12 @@ def test_parse_args_has_requested_batch_and_shard_defaults(tmp_path: Path) -> No
 
     assert args.shard_size == 2048
     assert args.batch_size == 8
-    assert args.offline_devices == "4,5,6,7"
+    assert args.devices == "0,1,2,3"
     assert args.tensor_parallel_size == 4
+    assert args.max_tokens == 2048
+    assert args.temperature == 0.6
+    assert args.top_p == 0.95
+    assert args.top_k == 20
 
 
 def test_iter_csv_samples_reads_one_file_and_preserves_source_row(
@@ -86,16 +62,53 @@ def test_iter_csv_samples_reads_one_file_and_preserves_source_row(
     assert samples == [Sample(0, "first"), Sample(2, "third")]
 
 
-def test_generation_payload_uses_online_sampling_and_distinct_row_seed() -> None:
-    args = make_args(seed=100)
+def test_create_local_llm_sets_generation_sampling_params(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = SimpleNamespace(llm=None, sampling=None)
 
-    payload = generation_payload(Sample(7, "hello"), args)
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            calls.llm = kwargs
 
-    assert payload["model"] == "qwen"
-    assert payload["messages"] == [{"role": "user", "content": "hello"}]
-    assert payload["max_tokens"] == 2048
-    assert payload["seed"] == 107
-    assert "kv_transfer_params" not in payload
+    class FakeSamplingParams:
+        def __init__(self, **kwargs):
+            calls.sampling = kwargs
+
+    fake_vllm = ModuleType("vllm")
+    fake_vllm.LLM = FakeLLM
+    fake_vllm.SamplingParams = FakeSamplingParams
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+
+    args = parse_args(
+        [
+            "--input-file",
+            str(tmp_path / "forelen.csv"),
+            "--model",
+            "/models/qwen",
+            "--hidden-states-dir",
+            str(tmp_path / "connector"),
+            "--seed",
+            "123",
+        ]
+    )
+
+    create_local_llm(args)
+
+    assert calls.sampling == {
+        "max_tokens": 2048,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "seed": 123,
+    }
+    assert calls.llm["speculative_config"]["method"] == "extract_hidden_states"
+    assert calls.llm["kv_transfer_config"]["kv_role"] == "kv_producer"
 
 
 def test_extract_last_token_hidden_states(tmp_path: Path) -> None:
@@ -103,13 +116,14 @@ def test_extract_last_token_hidden_states(tmp_path: Path) -> None:
     token_ids = torch.tensor([11, 12, 13])
     hidden_states = torch.arange(24, dtype=torch.float32).reshape(3, 2, 4)
     save_file({"token_ids": token_ids, "hidden_states": hidden_states}, source)
+    Path(f"{source}.lock").touch()
 
     last_hidden_states = extract_last_token_hidden_states(source)
 
     assert torch.equal(last_hidden_states, hidden_states[-1])
 
 
-def test_offline_hidden_states_deletes_batch_connector_files(
+def test_process_batch_generates_once_and_saves_local_output_lengths(
     tmp_path: Path,
 ) -> None:
     paths = []
@@ -126,71 +140,40 @@ def test_offline_hidden_states_deletes_batch_connector_files(
         paths.append(path)
 
     class FakeLLM:
+        calls = 0
+
         def generate(self, prompts, sampling_params, use_tqdm):
+            self.calls += 1
             assert prompts == ["a", "b"]
             assert use_tqdm is False
             return [
                 SimpleNamespace(
-                    kv_transfer_params={"hidden_states_path": str(path)}
+                    kv_transfer_params={"hidden_states_path": str(path)},
+                    outputs=[
+                        SimpleNamespace(
+                            token_ids=list(range(10 + index)),
+                            finish_reason="stop",
+                        )
+                    ],
                 )
-                for path in paths
+                for index, path in enumerate(paths)
             ]
 
-    result = offline_hidden_states(
-        FakeLLM(), object(), [Sample(0, "a"), Sample(1, "b")]
+    llm = FakeLLM()
+    hidden_states, generation_results = process_batch(
+        [Sample(0, "a"), Sample(1, "b")], llm, object()
     )
 
-    assert len(result) == 2
-    assert torch.equal(result[0], torch.zeros(1, 4))
-    assert torch.equal(result[1], torch.ones(1, 4))
+    assert llm.calls == 1
+    assert len(hidden_states) == 2
+    assert torch.equal(hidden_states[0], torch.zeros(1, 4))
+    assert torch.equal(hidden_states[1], torch.ones(1, 4))
+    assert generation_results == [
+        GenerationResult(10, "stop"),
+        GenerationResult(11, "stop"),
+    ]
     assert all(not path.exists() for path in paths)
     assert all(not Path(f"{path}.lock").exists() for path in paths)
-
-
-def test_process_batch_starts_online_work_before_offline_call(
-    tmp_path: Path,
-) -> None:
-    online_started = threading.Event()
-    allow_online_finish = threading.Event()
-    hidden_file = tmp_path / "hidden.safetensors"
-
-    def fake_request(*args, **kwargs):
-        online_started.set()
-        assert allow_online_finish.wait(timeout=2)
-        return {
-            "usage": {"completion_tokens": 17},
-            "choices": [{"finish_reason": "stop"}],
-        }
-
-    class FakeLLM:
-        def generate(self, prompts, sampling_params, use_tqdm):
-            assert online_started.wait(timeout=2)
-            save_file(
-                {
-                    "token_ids": torch.tensor([1]),
-                    "hidden_states": torch.ones(1, 1, 4),
-                },
-                hidden_file,
-            )
-            allow_online_finish.set()
-            return [
-                SimpleNamespace(
-                    kv_transfer_params={"hidden_states_path": str(hidden_file)}
-                )
-            ]
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        hidden, generations = process_batch(
-            [Sample(0, "prompt")],
-            FakeLLM(),
-            object(),
-            make_args(),
-            executor,
-            request_fn=fake_request,
-        )
-
-    assert len(hidden) == 1
-    assert generations == [GenerationResult(17, "stop")]
 
 
 def test_write_shard_and_csv_index(tmp_path: Path) -> None:

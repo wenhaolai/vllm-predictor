@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
-"""Build ForeLen length-prediction shards with online and offline vLLM.
+"""Build ForeLen length-prediction shards with one local vLLM engine.
 
-The online OpenAI-compatible server generates full answers and supplies their
-token lengths. One persistent offline ``vllm.LLM`` instance extracts prompt
-hidden states on a disjoint set of NPUs. Online requests are submitted before
-the synchronous offline call so both workloads run concurrently.
+Each local generation returns the generated token ids while the
+``extract_hidden_states`` connector saves prompt-only hidden states. After a
+batch completes, the final prompt-token state and generated length are stored
+using the existing safetensors-shard and CSV manifest format.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import json
 import os
 import sys
 import tempfile
-import time
-import urllib.error
-import urllib.request
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 
 CSV_FIELDS = (
@@ -43,7 +38,7 @@ class Sample:
 
 @dataclass(frozen=True)
 class GenerationResult:
-    """The length metadata returned by the online generation server."""
+    """Length metadata returned by the local vLLM generation."""
 
     completion_tokens: int
     finish_reason: str | None
@@ -51,10 +46,7 @@ class GenerationResult:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Extract last-prompt-token hidden states with an offline vLLM "
-            "instance while an online vLLM server generates length labels."
-        )
+        description=("Generate locally and extract last-prompt-token hidden states.")
     )
     parser.add_argument(
         "--input-file",
@@ -69,28 +61,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=Path("data/forelen_extracted"),
     )
     parser.add_argument(
-        "--url",
-        required=True,
-        help=(
-            "Online generation server base URL, for example "
-            "http://127.0.0.1:8001. A full /v1/chat/completions URL is also "
-            "accepted."
-        ),
-    )
-    parser.add_argument(
         "--model",
         required=True,
-        help="Model path or Hugging Face ID loaded once by the offline LLM.",
+        help="Model path or Hugging Face ID loaded once by the local LLM.",
     )
     parser.add_argument(
-        "--server-model",
-        default=None,
-        help="Online served model name; defaults to --model.",
-    )
-    parser.add_argument(
+        "--devices",
         "--offline-devices",
-        default="4,5,6,7",
-        help="ASCEND_RT_VISIBLE_DEVICES used by the offline process.",
+        dest="devices",
+        default="0,1,2,3",
+        help="ASCEND_RT_VISIBLE_DEVICES used by the local LLM process.",
     )
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
     parser.add_argument(
@@ -123,7 +103,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=8,
-        help="Prompts submitted together to the persistent offline LLM.",
+        help="Prompts submitted together to the persistent local LLM.",
     )
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -137,11 +117,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--seed",
         type=int,
         default=None,
-        help="Optional base seed; source_row is added for each online request.",
+        help="Optional sampling seed.",
     )
-    parser.add_argument("--timeout", type=float, default=3600.0)
-    parser.add_argument("--retries", type=int, default=3)
-    parser.add_argument("--retry-backoff", type=float, default=2.0)
     parser.add_argument(
         "--limit",
         type=int,
@@ -182,10 +159,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--top-k must be -1, 0, or a positive integer")
     if not 0 <= args.min_p <= 1:
         parser.error("--min-p must be in [0, 1]")
-    if args.retries < 0:
-        parser.error("--retries must be non-negative")
-    if args.retry_backoff < 0:
-        parser.error("--retry-backoff must be non-negative")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
     return args
@@ -221,108 +194,13 @@ def batched(items: Iterable[Sample], size: int) -> Iterator[list[Sample]]:
         yield batch
 
 
-def _chat_completions_url(url: str) -> str:
-    normalized = url.rstrip("/")
-    if normalized.endswith("/v1/chat/completions"):
-        return normalized
-    return f"{normalized}/v1/chat/completions"
+def create_local_llm(args: argparse.Namespace) -> tuple[Any, Any]:
+    """Set NPU visibility and construct one persistent local engine."""
 
-
-def generation_payload(sample: Sample, args: argparse.Namespace) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "model": args.server_model or args.model,
-        "messages": [{"role": "user", "content": sample.prompt}],
-        "max_tokens": args.max_tokens,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "top_k": args.top_k,
-        "min_p": args.min_p,
-        "presence_penalty": args.presence_penalty,
-        "frequency_penalty": args.frequency_penalty,
-        "repetition_penalty": args.repetition_penalty,
-        "stream": False,
-    }
-    if args.seed is not None:
-        payload["seed"] = (args.seed + sample.source_row) % (2**63 - 1)
-    return payload
-
-
-def _http_error_message(exc: urllib.error.HTTPError) -> str:
-    details = exc.read().decode("utf-8", errors="replace")
-    return f"HTTP {exc.code}: {details}"
-
-
-def post_json(
-    url: str,
-    payload: Mapping[str, Any],
-    *,
-    timeout: float,
-    retries: int,
-    retry_backoff: float,
-) -> dict[str, Any]:
-    """POST JSON, retrying only transport and transient HTTP failures."""
-
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    attempts = retries + 1
-    for attempt in range(attempts):
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                result = json.load(response)
-            if not isinstance(result, dict):
-                raise RuntimeError(f"Expected a JSON object from {url}")
-            return result
-        except urllib.error.HTTPError as exc:
-            message = _http_error_message(exc)
-            retryable = exc.code in {408, 409, 425, 429} or exc.code >= 500
-            if not retryable or attempt + 1 >= attempts:
-                raise RuntimeError(message) from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            message = f"Request to {url} failed: {exc}"
-            if attempt + 1 >= attempts:
-                raise RuntimeError(message) from exc
-        time.sleep(retry_backoff * (2**attempt))
-    raise AssertionError("unreachable")
-
-
-RequestFunction = Callable[..., dict[str, Any]]
-
-
-def request_generation(
-    sample: Sample,
-    args: argparse.Namespace,
-    request_fn: RequestFunction = post_json,
-) -> GenerationResult:
-    response = request_fn(
-        _chat_completions_url(args.url),
-        generation_payload(sample, args),
-        timeout=args.timeout,
-        retries=args.retries,
-        retry_backoff=args.retry_backoff,
-    )
-    usage = response.get("usage") or {}
-    completion_tokens = usage.get("completion_tokens")
-    if not isinstance(completion_tokens, int):
-        raise RuntimeError(
-            "Online response does not contain integer usage.completion_tokens"
-        )
-    choices = response.get("choices") or []
-    finish_reason = choices[0].get("finish_reason") if choices else None
-    return GenerationResult(completion_tokens, finish_reason)
-
-
-def create_offline_llm(args: argparse.Namespace) -> tuple[Any, Any]:
-    """Set NPU visibility, then construct the one persistent offline engine."""
-
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = args.offline_devices
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = args.devices
     args.hidden_states_dir.mkdir(parents=True, exist_ok=True)
 
-    # Import only after ASCEND_RT_VISIBLE_DEVICES is fixed. The online server
-    # is a separate process and should be launched on devices 0-3.
+    # Import only after ASCEND_RT_VISIBLE_DEVICES is fixed.
     from vllm import LLM, SamplingParams
 
     llm = LLM(
@@ -351,7 +229,17 @@ def create_offline_llm(args: argparse.Namespace) -> tuple[Any, Any]:
             },
         },
     )
-    sampling_params = SamplingParams(max_tokens=1, temperature=0.0)
+    sampling_params = SamplingParams(
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        min_p=args.min_p,
+        presence_penalty=args.presence_penalty,
+        frequency_penalty=args.frequency_penalty,
+        repetition_penalty=args.repetition_penalty,
+        seed=args.seed,
+    )
     return llm, sampling_params
 
 
@@ -360,7 +248,7 @@ def output_hidden_states_path(output: Any) -> Path:
     path = params.get("hidden_states_path")
     if not path:
         raise RuntimeError(
-            "Offline RequestOutput does not contain "
+            "Local RequestOutput does not contain "
             "kv_transfer_params.hidden_states_path"
         )
     return Path(path)
@@ -369,13 +257,22 @@ def output_hidden_states_path(output: Any) -> Path:
 def extract_last_token_hidden_states(path: Path) -> Any:
     """Load one connector file and retain only its last prompt token."""
 
-    from safetensors import safe_open
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1 import (
+            example_hidden_states_connector,
+        )
+    except ImportError:
+        if not path.is_file():
+            raise FileNotFoundError(f"Hidden-state file does not exist: {path}")
+        from safetensors import safe_open
 
-    if not path.is_file():
-        raise FileNotFoundError(f"Hidden-state file does not exist: {path}")
-    with safe_open(str(path), framework="pt", device="cpu") as tensors:
-        token_ids = tensors.get_tensor("token_ids")
-        hidden_states = tensors.get_tensor("hidden_states")
+        with safe_open(str(path), framework="pt", device="cpu") as tensors:
+            token_ids = tensors.get_tensor("token_ids")
+            hidden_states = tensors.get_tensor("hidden_states")
+    else:
+        tensors = example_hidden_states_connector.load_hidden_states(str(path))
+        token_ids = tensors["token_ids"]
+        hidden_states = tensors["hidden_states"]
     if token_ids.ndim != 1 or token_ids.shape[0] == 0:
         raise ValueError(f"Unexpected token_ids shape: {list(token_ids.shape)}")
     if hidden_states.ndim < 2 or hidden_states.shape[0] != token_ids.shape[0]:
@@ -389,16 +286,42 @@ def extract_last_token_hidden_states(path: Path) -> Any:
 def delete_connector_file(path: Path) -> None:
     """Delete one temporary safetensors file and its synchronization lock."""
 
-    Path(f"{path}.lock").unlink(missing_ok=True)
-    path.unlink(missing_ok=True)
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1 import (
+            example_hidden_states_connector,
+        )
+    except ImportError:
+        Path(f"{path}.lock").unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+    else:
+        example_hidden_states_connector.cleanup_hidden_states(str(path))
 
 
-def offline_hidden_states(
+def generation_result(output: Any) -> GenerationResult:
+    """Read the actual generated length from one local RequestOutput."""
+
+    completions = getattr(output, "outputs", None) or []
+    if len(completions) != 1:
+        raise RuntimeError(
+            "Expected exactly one completion per prompt, "
+            f"but received {len(completions)}"
+        )
+    completion = completions[0]
+    token_ids = getattr(completion, "token_ids", None)
+    if token_ids is None:
+        raise RuntimeError("Local completion does not contain token_ids")
+    return GenerationResult(
+        completion_tokens=len(token_ids),
+        finish_reason=getattr(completion, "finish_reason", None),
+    )
+
+
+def process_batch(
+    samples: Sequence[Sample],
     llm: Any,
     sampling_params: Any,
-    samples: Sequence[Sample],
-) -> list[Any]:
-    """Run one offline batch, load final-token states, and clean all dumps."""
+) -> tuple[list[Any], list[GenerationResult]]:
+    """Generate once, then collect prompt states and generated lengths."""
 
     outputs = llm.generate(
         [sample.prompt for sample in samples],
@@ -407,41 +330,19 @@ def offline_hidden_states(
     )
     if len(outputs) != len(samples):
         raise RuntimeError(
-            f"Offline LLM returned {len(outputs)} outputs for {len(samples)} prompts"
+            f"Local LLM returned {len(outputs)} outputs for {len(samples)} prompts"
         )
 
     paths: list[Path] = []
     try:
         for output in outputs:
             paths.append(output_hidden_states_path(output))
-        return [extract_last_token_hidden_states(path) for path in paths]
+        hidden_states = [extract_last_token_hidden_states(path) for path in paths]
+        generation_results = [generation_result(output) for output in outputs]
+        return hidden_states, generation_results
     finally:
         for path in paths:
             delete_connector_file(path)
-
-
-def process_batch(
-    samples: Sequence[Sample],
-    llm: Any,
-    sampling_params: Any,
-    args: argparse.Namespace,
-    executor: ThreadPoolExecutor,
-    request_fn: RequestFunction = post_json,
-) -> tuple[list[Any], list[GenerationResult]]:
-    """Overlap online generation requests with one offline LLM batch."""
-
-    generation_futures: list[Future[GenerationResult]] = [
-        executor.submit(request_generation, sample, args, request_fn)
-        for sample in samples
-    ]
-    try:
-        hidden_states = offline_hidden_states(llm, sampling_params, samples)
-        generation_results = [future.result() for future in generation_futures]
-    except BaseException:
-        for future in generation_futures:
-            future.cancel()
-        raise
-    return hidden_states, generation_results
 
 
 def next_shard_index(output_dir: Path) -> int:
@@ -614,11 +515,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from tqdm import tqdm
 
-    print(
-        f"Loading offline model on Ascend devices {args.offline_devices}; "
-        f"online generation server: {_chat_completions_url(args.url)}"
-    )
-    llm, sampling_params = create_offline_llm(args)
+    print(f"Loading local model on Ascend devices {args.devices}")
+    llm, sampling_params = create_local_llm(args)
     shard_index = next_shard_index(output_dir)
     samples = pending_samples(
         input_file,
@@ -627,13 +525,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.limit,
     )
 
-    with (
-        ThreadPoolExecutor(
-            max_workers=args.batch_size,
-            thread_name_prefix="online-generation",
-        ) as executor,
-        tqdm(total=pending_count, unit="sample", desc=input_file.name) as progress,
-    ):
+    with tqdm(
+        total=pending_count,
+        unit="sample",
+        desc=input_file.name,
+    ) as progress:
         for shard_samples in batched(samples, args.shard_size):
             shard_hidden_states: list[Any] = []
             shard_generation_results: list[GenerationResult] = []
@@ -642,8 +538,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     request_batch,
                     llm,
                     sampling_params,
-                    args,
-                    executor,
                 )
                 shard_hidden_states.extend(hidden_states)
                 shard_generation_results.extend(generation_results)
