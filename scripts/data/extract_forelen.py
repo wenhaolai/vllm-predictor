@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Build ForeLen length-prediction shards with one local vLLM engine.
+"""Extract prompt hidden states with one local vLLM engine.
 
-Each local generation returns the generated token ids while the
-``extract_hidden_states`` connector saves prompt-only hidden states. After a
-batch completes, the final prompt-token state and generated length are stored
-using the existing safetensors-shard and CSV manifest format.
+The ``extract_hidden_states`` connector saves prompt-only hidden states. After
+each batch completes, the final prompt-token state is stored in a safetensors
+shard. A CSV manifest maps every tensor back to its original input row. The
+single generated token is only used to complete the extraction request; no
+answer-length label is collected.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ CSV_FIELDS = (
     "source_row",
     "hidden_states_path",
     "hidden_states_row",
-    "completion_tokens",
 )
 
 
@@ -52,17 +52,9 @@ class Sample:
     prompt: str
 
 
-@dataclass(frozen=True)
-class GenerationResult:
-    """Length metadata returned by the local vLLM generation."""
-
-    completion_tokens: int
-    finish_reason: str | None
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=("Generate locally and extract last-prompt-token hidden states.")
+        description=("Extract last-prompt-token hidden states with four NPUs.")
     )
     parser.add_argument(
         "--input-file",
@@ -132,7 +124,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=8,
         help="Prompts submitted together to the persistent local LLM.",
     )
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        choices=(1,),
+        default=1,
+        help="Must be 1 for vLLM-Ascend extract_hidden_states mode.",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=20)
@@ -168,8 +166,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--shard-size must be at least 1")
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
-    if args.tensor_parallel_size < 1:
-        parser.error("--tensor-parallel-size must be at least 1")
+    device_ids = [device.strip() for device in args.devices.split(",") if device.strip()]
+    if len(device_ids) != 4 or len(set(device_ids)) != 4:
+        parser.error("--devices must contain exactly four distinct NPU IDs")
+    if args.tensor_parallel_size != 4:
+        parser.error("--tensor-parallel-size must be 4 for this extraction job")
     if args.block_size < 1:
         parser.error("--block-size must be at least 1")
     if args.max_model_len < 1:
@@ -178,8 +179,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--gpu-memory-utilization must be in (0, 1]")
     if not args.hidden_layer_ids or min(args.hidden_layer_ids) < 0:
         parser.error("--hidden-layer-ids must contain non-negative integers")
-    if args.max_tokens < 1:
-        parser.error("--max-tokens must be at least 1")
     if args.temperature <= 0:
         parser.error("--temperature must be > 0")
     if not 0 < args.top_p <= 1:
@@ -347,31 +346,12 @@ def delete_connector_file(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-def generation_result(output: Any) -> GenerationResult:
-    """Read the actual generated length from one local RequestOutput."""
-
-    completions = getattr(output, "outputs", None) or []
-    if len(completions) != 1:
-        raise RuntimeError(
-            "Expected exactly one completion per prompt, "
-            f"but received {len(completions)}"
-        )
-    completion = completions[0]
-    token_ids = getattr(completion, "token_ids", None)
-    if token_ids is None:
-        raise RuntimeError("Local completion does not contain token_ids")
-    return GenerationResult(
-        completion_tokens=len(token_ids),
-        finish_reason=getattr(completion, "finish_reason", None),
-    )
-
-
 def process_batch(
     samples: Sequence[Sample],
     llm: Any,
     sampling_params: Any,
-) -> tuple[list[Any], list[GenerationResult]]:
-    """Generate once, then collect prompt states and generated lengths."""
+) -> list[Any]:
+    """Run one extraction request and collect last-prompt-token states."""
 
     first_row = samples[0].source_row
     last_row = samples[-1].source_row
@@ -393,7 +373,7 @@ def process_batch(
         )
     generation_seconds = time.perf_counter() - started_at
     LOGGER.info(
-        "Generation completed: size=%d elapsed=%.3fs",
+        "Extraction request completed: size=%d elapsed=%.3fs",
         len(samples),
         generation_seconds,
     )
@@ -403,18 +383,12 @@ def process_batch(
         for output in outputs:
             paths.append(output_hidden_states_path(output))
         hidden_states = [extract_last_token_hidden_states(path) for path in paths]
-        generation_results = [generation_result(output) for output in outputs]
-        lengths = [result.completion_tokens for result in generation_results]
         LOGGER.info(
-            "Batch extracted: hidden_state_shape=%s generated_tokens="
-            "min=%d avg=%.2f max=%d total=%d",
+            "Batch extracted: samples=%d hidden_state_shape=%s",
+            len(hidden_states),
             tuple(hidden_states[0].shape),
-            min(lengths),
-            sum(lengths) / len(lengths),
-            max(lengths),
-            sum(lengths),
         )
-        return hidden_states, generation_results
+        return hidden_states
     finally:
         for path in paths:
             delete_connector_file(path)
@@ -491,9 +465,12 @@ def load_completed_rows(results_path: Path, source_file: str) -> set[int]:
     completed: set[int] = set()
     with results_path.open("r", encoding="utf-8", newline="") as results:
         reader = csv.DictReader(results)
-        if tuple(reader.fieldnames or ()) != CSV_FIELDS:
+        fieldnames = tuple(reader.fieldnames or ())
+        missing_fields = set(CSV_FIELDS).difference(fieldnames)
+        if missing_fields:
             raise ValueError(
-                f"Unexpected columns in {results_path}: {reader.fieldnames}"
+                f"Missing columns in {results_path}: {sorted(missing_fields)}; "
+                f"columns={reader.fieldnames}"
             )
         for row in reader:
             if row["source_file"] != source_file:
@@ -509,25 +486,31 @@ def append_results(
     source_file: str,
     samples: Sequence[Sample],
     shard_path: Path,
-    generation_results: Sequence[GenerationResult],
 ) -> None:
-    if len(samples) != len(generation_results):
-        raise ValueError("Sample and generation result counts do not match")
     write_header = not results_path.exists() or results_path.stat().st_size == 0
+    fieldnames: Sequence[str] = CSV_FIELDS
+    if not write_header:
+        with results_path.open("r", encoding="utf-8", newline="") as results:
+            existing_fieldnames = csv.DictReader(results).fieldnames or []
+        missing_fields = set(CSV_FIELDS).difference(existing_fieldnames)
+        if missing_fields:
+            raise ValueError(
+                f"Missing columns in {results_path}: {sorted(missing_fields)}; "
+                f"columns={existing_fieldnames}"
+            )
+        # Preserve a legacy completion_tokens column without populating it.
+        fieldnames = existing_fieldnames
     with results_path.open("a", encoding="utf-8", newline="") as results:
-        writer = csv.DictWriter(results, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(results, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
-        for hidden_states_row, (sample, generation) in enumerate(
-            zip(samples, generation_results, strict=True)
-        ):
+        for hidden_states_row, sample in enumerate(samples):
             writer.writerow(
                 {
                     "source_file": source_file,
                     "source_row": sample.source_row,
                     "hidden_states_path": str(shard_path),
                     "hidden_states_row": hidden_states_row,
-                    "completion_tokens": generation.completion_tokens,
                 }
             )
         results.flush()
@@ -629,15 +612,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             shard_started_at = time.perf_counter()
             shard_hidden_states: list[Any] = []
-            shard_generation_results: list[GenerationResult] = []
             for request_batch in batched(shard_samples, args.batch_size):
-                hidden_states, generation_results = process_batch(
+                hidden_states = process_batch(
                     request_batch,
                     llm,
                     sampling_params,
                 )
                 shard_hidden_states.extend(hidden_states)
-                shard_generation_results.extend(generation_results)
                 progress.update(len(request_batch))
 
             shard_path = write_shard(
@@ -650,7 +631,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 source_file,
                 shard_samples,
                 shard_path,
-                shard_generation_results,
             )
             progress.set_postfix_str(shard_path.name)
             LOGGER.info(

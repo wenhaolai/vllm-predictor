@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -14,7 +15,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts" / "data")
 
 from extract_forelen import (  # noqa: E402
     CSV_FIELDS,
-    GenerationResult,
     Sample,
     append_results,
     create_local_llm,
@@ -45,10 +45,38 @@ def test_parse_args_has_requested_batch_and_shard_defaults(tmp_path: Path) -> No
     assert args.enable_prefix_caching is False
     assert args.max_model_len == 32768
     assert args.gpu_memory_utilization == 0.9
-    assert args.max_tokens == 2048
+    assert args.max_tokens == 1
     assert args.temperature == 1.0
     assert args.top_p == 0.95
     assert args.top_k == 20
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (["--max-tokens", "2"], "invalid choice"),
+        (["--devices", "0,1,2"], "exactly four distinct"),
+        (["--tensor-parallel-size", "2"], "must be 4"),
+    ],
+)
+def test_parse_args_enforces_hidden_extraction_resources(
+    tmp_path: Path,
+    extra_args: list[str],
+    message: str,
+    capsys,
+) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--input-file",
+                str(tmp_path / "forelen.csv"),
+                "--model",
+                "/models/qwen",
+                *extra_args,
+            ]
+        )
+
+    assert message in capsys.readouterr().err
 
 
 def test_iter_csv_samples_reads_one_file_and_preserves_source_row(
@@ -102,7 +130,7 @@ def test_create_local_llm_sets_generation_sampling_params(
     create_local_llm(args)
 
     assert calls.sampling == {
-        "max_tokens": 2048,
+        "max_tokens": 1,
         "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20,
@@ -133,7 +161,7 @@ def test_extract_last_token_hidden_states(tmp_path: Path) -> None:
     assert torch.equal(last_hidden_states, hidden_states[-1])
 
 
-def test_process_batch_generates_once_and_saves_local_output_lengths(
+def test_process_batch_generates_once_without_reading_output_lengths(
     tmp_path: Path,
 ) -> None:
     paths = []
@@ -159,18 +187,12 @@ def test_process_batch_generates_once_and_saves_local_output_lengths(
             return [
                 SimpleNamespace(
                     kv_transfer_params={"hidden_states_path": str(path)},
-                    outputs=[
-                        SimpleNamespace(
-                            token_ids=list(range(10 + index)),
-                            finish_reason="stop",
-                        )
-                    ],
                 )
-                for index, path in enumerate(paths)
+                for path in paths
             ]
 
     llm = FakeLLM()
-    hidden_states, generation_results = process_batch(
+    hidden_states = process_batch(
         [Sample(0, "a"), Sample(1, "b")], llm, object()
     )
 
@@ -178,10 +200,6 @@ def test_process_batch_generates_once_and_saves_local_output_lengths(
     assert len(hidden_states) == 2
     assert torch.equal(hidden_states[0], torch.zeros(1, 4))
     assert torch.equal(hidden_states[1], torch.ones(1, 4))
-    assert generation_results == [
-        GenerationResult(10, "stop"),
-        GenerationResult(11, "stop"),
-    ]
     assert all(not path.exists() for path in paths)
     assert all(not Path(f"{path}.lock").exists() for path in paths)
 
@@ -189,11 +207,10 @@ def test_process_batch_generates_once_and_saves_local_output_lengths(
 def test_write_shard_and_csv_index(tmp_path: Path) -> None:
     samples = [Sample(3, "a"), Sample(9, "b")]
     hidden_states = [torch.zeros(1, 4), torch.ones(1, 4)]
-    generations = [GenerationResult(10, "stop"), GenerationResult(20, "length")]
 
     shard = write_shard(tmp_path, 0, hidden_states)
     results = tmp_path / "samples.csv"
-    append_results(results, "/data/forelen.csv", samples, shard, generations)
+    append_results(results, "/data/forelen.csv", samples, shard)
 
     assert shard.name == "shards-000000.safetensors"
     with safe_open(shard, framework="pt", device="cpu") as tensors:
@@ -208,13 +225,11 @@ def test_write_shard_and_csv_index(tmp_path: Path) -> None:
             "source_row": "3",
             "hidden_states_path": str(shard),
             "hidden_states_row": "0",
-            "completion_tokens": "10",
         },
         {
             "source_file": "/data/forelen.csv",
             "source_row": "9",
             "hidden_states_path": str(shard),
             "hidden_states_row": "1",
-            "completion_tokens": "20",
         },
     ]

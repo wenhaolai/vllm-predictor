@@ -24,7 +24,7 @@ python /home/laiwenhao/vllm-predictor/scripts/data/extract_forelen.py \
     --hidden-states-dir /dev/shm/vllm_forelen_hidden_states \
     --shard-size 2048 \
     --batch-size 8 \
-    --max-tokens 2048 \
+    --max-tokens 1 \
     --temperature 1.0 \
     --top-p 0.95 \
     --top-k 20 \
