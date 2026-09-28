@@ -15,14 +15,17 @@ python /home/laiwenhao/vllm-predictor/scripts/data/extract_forelen.py \
     --devices 0,1,2,3 \
     --tensor-parallel-size 4 \
     --distributed-executor-backend mp \
-    --max-model-len 8192 \
-    --gpu-memory-utilization 0.95 \
+    --block-size 128 \
+    --no-enable-chunked-prefill \
+    --no-enable-prefix-caching \
+    --max-model-len 32768 \
+    --gpu-memory-utilization 0.9 \
     --hidden-layer-ids 64 \
     --hidden-states-dir /dev/shm/vllm_forelen_hidden_states \
     --shard-size 2048 \
     --batch-size 8 \
     --max-tokens 2048 \
-    --temperature 0.6 \
+    --temperature 1.0 \
     --top-p 0.95 \
     --top-k 20 \
     --min-p 0.0 \

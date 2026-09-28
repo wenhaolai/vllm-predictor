@@ -40,8 +40,13 @@ def test_parse_args_has_requested_batch_and_shard_defaults(tmp_path: Path) -> No
     assert args.batch_size == 8
     assert args.devices == "0,1,2,3"
     assert args.tensor_parallel_size == 4
+    assert args.block_size == 128
+    assert args.enable_chunked_prefill is False
+    assert args.enable_prefix_caching is False
+    assert args.max_model_len == 32768
+    assert args.gpu_memory_utilization == 0.9
     assert args.max_tokens == 2048
-    assert args.temperature == 0.6
+    assert args.temperature == 1.0
     assert args.top_p == 0.95
     assert args.top_k == 20
 
@@ -98,7 +103,7 @@ def test_create_local_llm_sets_generation_sampling_params(
 
     assert calls.sampling == {
         "max_tokens": 2048,
-        "temperature": 0.6,
+        "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,
@@ -109,6 +114,11 @@ def test_create_local_llm_sets_generation_sampling_params(
     }
     assert calls.llm["speculative_config"]["method"] == "extract_hidden_states"
     assert calls.llm["kv_transfer_config"]["kv_role"] == "kv_producer"
+    assert calls.llm["block_size"] == 128
+    assert calls.llm["enable_chunked_prefill"] is False
+    assert calls.llm["enable_prefix_caching"] is False
+    assert calls.llm["max_model_len"] == 32768
+    assert calls.llm["gpu_memory_utilization"] == 0.9
 
 
 def test_extract_last_token_hidden_states(tmp_path: Path) -> None:

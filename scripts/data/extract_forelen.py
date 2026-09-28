@@ -78,8 +78,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="mp",
         choices=("mp", "ray", "uni", "external_launcher"),
     )
-    parser.add_argument("--max-model-len", type=int, default=8192)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
+    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument(
+        "--enable-chunked-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--enable-prefix-caching",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--hidden-layer-ids",
         type=int,
@@ -106,7 +117,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Prompts submitted together to the persistent local LLM.",
     )
     parser.add_argument("--max-tokens", type=int, default=2048)
-    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--min-p", type=float, default=0.0)
@@ -143,6 +154,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--batch-size must be at least 1")
     if args.tensor_parallel_size < 1:
         parser.error("--tensor-parallel-size must be at least 1")
+    if args.block_size < 1:
+        parser.error("--block-size must be at least 1")
     if args.max_model_len < 1:
         parser.error("--max-model-len must be at least 1")
     if not 0 < args.gpu_memory_utilization <= 1:
@@ -205,8 +218,11 @@ def create_local_llm(args: argparse.Namespace) -> tuple[Any, Any]:
 
     llm = LLM(
         model=args.model,
+        block_size=args.block_size,
         tensor_parallel_size=args.tensor_parallel_size,
         distributed_executor_backend=args.distributed_executor_backend,
+        enable_chunked_prefill=args.enable_chunked_prefill,
+        enable_prefix_caching=args.enable_prefix_caching,
         max_model_len=args.max_model_len,
         max_num_seqs=args.batch_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
@@ -257,22 +273,13 @@ def output_hidden_states_path(output: Any) -> Path:
 def extract_last_token_hidden_states(path: Path) -> Any:
     """Load one connector file and retain only its last prompt token."""
 
-    try:
-        from vllm.distributed.kv_transfer.kv_connector.v1 import (
-            example_hidden_states_connector,
-        )
-    except ImportError:
-        if not path.is_file():
-            raise FileNotFoundError(f"Hidden-state file does not exist: {path}")
-        from safetensors import safe_open
+    from safetensors import safe_open
 
-        with safe_open(str(path), framework="pt", device="cpu") as tensors:
-            token_ids = tensors.get_tensor("token_ids")
-            hidden_states = tensors.get_tensor("hidden_states")
-    else:
-        tensors = example_hidden_states_connector.load_hidden_states(str(path))
-        token_ids = tensors["token_ids"]
-        hidden_states = tensors["hidden_states"]
+    if not path.is_file():
+        raise FileNotFoundError(f"Hidden-state file does not exist: {path}")
+    with safe_open(str(path), framework="pt", device="cpu") as tensors:
+        token_ids = tensors.get_tensor("token_ids")
+        hidden_states = tensors.get_tensor("hidden_states")
     if token_ids.ndim != 1 or token_ids.shape[0] == 0:
         raise ValueError(f"Unexpected token_ids shape: {list(token_ids.shape)}")
     if hidden_states.ndim < 2 or hidden_states.shape[0] != token_ids.shape[0]:
@@ -286,15 +293,8 @@ def extract_last_token_hidden_states(path: Path) -> Any:
 def delete_connector_file(path: Path) -> None:
     """Delete one temporary safetensors file and its synchronization lock."""
 
-    try:
-        from vllm.distributed.kv_transfer.kv_connector.v1 import (
-            example_hidden_states_connector,
-        )
-    except ImportError:
-        Path(f"{path}.lock").unlink(missing_ok=True)
-        path.unlink(missing_ok=True)
-    else:
-        example_hidden_states_connector.cleanup_hidden_states(str(path))
+    Path(f"{path}.lock").unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
 
 
 def generation_result(output: Any) -> GenerationResult:
