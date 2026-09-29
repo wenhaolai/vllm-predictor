@@ -34,21 +34,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-file", type=Path, required=True)
     parser.add_argument("--prompt-column", default="user_prompt_content")
-    parser.add_argument("--output-dir", type=Path, default=Path("data/forelen_lengths"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data/forelen_lengths_2048"))
     parser.add_argument("--model", required=True)
     parser.add_argument("--devices", default="0,1,2,3")
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
-    parser.add_argument("--distributed-executor-backend", default="mp",
-                        choices=("mp", "ray", "uni", "external_launcher"))
+    parser.add_argument("--distributed-executor-backend", default="auto",
+                        choices=("auto", "mp", "ray", "uni", "external_launcher"),
+                        help="auto leaves backend selection to vLLM, as in the reference example.")
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--max-tokens", type=int, default=16384,
+    parser.add_argument("--max-tokens", type=int, default=2048,
                         help="Maximum generated tokens per prompt; normal EOS stopping is enabled.")
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=-1)
     parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--presence-penalty", type=float, default=0.0)
     parser.add_argument("--frequency-penalty", type=float, default=0.0)
@@ -58,7 +59,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="Process at most this many unfinished rows; omit for all rows.")
     for name, default in (("enable-chunked-prefill", False),
                           ("enable-prefix-caching", False),
-                          ("trust-remote-code", True), ("enforce-eager", True)):
+                          ("trust-remote-code", False), ("enforce-eager", True)):
         parser.add_argument(f"--{name}", action=argparse.BooleanOptionalAction,
                             default=default)
     args = parser.parse_args(argv)
@@ -100,11 +101,15 @@ def create_local_llm(args: argparse.Namespace) -> tuple[Any, Any]:
     sampling_keys = ("max_tokens", "temperature", "top_p", "top_k", "min_p",
                      "presence_penalty", "frequency_penalty", "repetition_penalty", "seed")
     engine_kwargs = {key: getattr(args, key) for key in engine_keys}
+    if args.distributed_executor_backend == "auto":
+        del engine_kwargs["distributed_executor_backend"]
     sampling_kwargs = {key: getattr(args, key) for key in sampling_keys}
     LOGGER.info("Initializing LLM: devices=%s settings=%s", args.devices, engine_kwargs)
     LOGGER.info("Sampling settings: %s", sampling_kwargs)
     sampling_params = SamplingParams(**sampling_kwargs)
-    llm = LLM(**engine_kwargs, max_num_seqs=args.batch_size)
+    # Match the reference engine's scheduler defaults. batch_size only controls
+    # how many CSV prompts we submit in each generate() call.
+    llm = LLM(**engine_kwargs)
     return llm, sampling_params
 
 

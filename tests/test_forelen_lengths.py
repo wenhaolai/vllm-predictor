@@ -40,6 +40,8 @@ def test_normal_engine_has_no_extraction_settings(monkeypatch):
     assert "speculative_config" not in calls
     assert "kv_transfer_config" not in calls
     assert calls["tensor_parallel_size"] == 2
+    assert "max_num_seqs" not in calls
+    assert "distributed_executor_backend" not in calls
     assert sampling["max_tokens"] == 100
     assert sampling["temperature"] == 0
 
@@ -118,6 +120,35 @@ def test_run_script_arguments_are_accepted():
     script = (ROOT / "scripts/data/run_extract_forelen_lengths.sh").read_text()
     command = script[script.index("python /home"):].replace("\\\n", " ")
     args = lengths.parse_args(shlex.split(command)[2:])
-    assert args.max_tokens == 16384
-    assert args.seed == 42
+    assert args.max_tokens == 2048
+    assert args.temperature == 1.0
+    assert args.top_p == 1.0
+    assert args.top_k == -1
+    assert args.seed is None
+    assert args.distributed_executor_backend == "auto"
+    assert args.output_dir.name == "forelen_lengths_2048"
     assert args.limit is None
+
+
+def test_reference_engine_and_sampling_defaults(monkeypatch):
+    fake = ModuleType("vllm")
+    fake.LLM = lambda **kwargs: kwargs
+    fake.SamplingParams = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, "vllm", fake)
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "")
+    args = lengths.parse_args(["--input-file", "input.csv", "--model", "qwen"])
+    engine, sampling = lengths.create_local_llm(args)
+    assert engine == {
+        "model": "qwen", "block_size": 128, "tensor_parallel_size": 4,
+        "enable_chunked_prefill": False, "enable_prefix_caching": False,
+        "max_model_len": 32768, "gpu_memory_utilization": 0.9,
+        "enforce_eager": True, "trust_remote_code": False,
+    }
+    assert sampling == {
+        "max_tokens": 2048, "temperature": 1.0, "top_p": 1.0, "top_k": -1,
+        "min_p": 0.0, "presence_penalty": 0.0, "frequency_penalty": 0.0,
+        "repetition_penalty": 1.0, "seed": None,
+    }
+    args.distributed_executor_backend = "mp"
+    engine, _ = lengths.create_local_llm(args)
+    assert engine["distributed_executor_backend"] == "mp"
