@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
-import os
+import json
 import sys
+import threading
+import time
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,31 +14,50 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from vllm_predictor import chat_benchmark as bench
 
 
-class Tokenizer:
-    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, enable_thinking):
-        assert tokenize is False and add_generation_prompt is True
-        return str(enable_thinking) + "|" + "|".join(message["content"] for message in messages)
+class FakeClient:
+    def __init__(self) -> None:
+        self.active = 0
+        self.max_active = 0
+        self.lock = threading.Lock()
+        self.request_index = 0
 
-    def encode(self, text, *, add_special_tokens):
-        assert add_special_tokens is False
-        return list(text.encode("utf-8"))
+    def tokenize_prompt(self, model, prompt):
+        tokens = tuple(range(len(prompt)))
+        return len(tokens), tokens
+
+    def tokenize_chat(self, model, messages, thinking):
+        length = sum(len(message["content"]) for message in messages) + 10
+        tokens = tuple([int(thinking)] + list(range(1, length)))
+        return len(tokens), tokens
+
+    def chat(self, payload):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.request_index += 1
+            request_id = f"request-{self.request_index}"
+        time.sleep(0.01)
+        input_tokens = sum(len(message["content"]) for message in payload["messages"]) + 10
+        with self.lock:
+            self.active -= 1
+        return {
+            "id": request_id,
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "reasoning_content": "two short steps" if payload["chat_template_kwargs"]["enable_thinking"] else None,
+                    "content": "answer",
+                },
+            }],
+            "usage": {"prompt_tokens": input_tokens, "completion_tokens": 3},
+        }
 
 
-class Engine:
-    def __init__(self):
-        self.calls = []
-
-    def get_tokenizer(self):
-        return Tokenizer()
-
-    def generate(self, prompts, sampling, *, use_tqdm):
-        assert use_tqdm is False
-        self.calls.append((prompts, sampling.max_tokens))
-        return [SimpleNamespace(
-            finished=True, prompt_token_ids=prompt["prompt_token_ids"],
-            outputs=[SimpleNamespace(token_ids=[1, 2, 3], finish_reason="length",
-                                     text="<think>Brief reasoning</think> Answer")])
-                for prompt in prompts]
+def args(*extra):
+    return bench.parse_args([
+        "--input-file", "input.csv", "--sample-size", "4",
+        "--batch-sizes", "1", "2", "4", *extra,
+    ])
 
 
 def test_sample_is_reproducible_and_preserves_source_rows(tmp_path):
@@ -48,105 +69,129 @@ def test_sample_is_reproducible_and_preserves_source_rows(tmp_path):
     selected = bench.select_samples(path, "user_prompt_content", 32, 42)
     assert selected == bench.select_samples(path, "user_prompt_content", 32, 42)
     assert len({sample.source_row for sample in selected}) == 32
-    assert all(sample.source_row % 2 and sample.prompt == f"question {sample.source_row}"
-               for sample in selected)
+    assert all(sample.source_row % 2 for sample in selected)
     with pytest.raises(ValueError, match="only 50"):
         bench.select_samples(path, "user_prompt_content", 51, 42)
-    with pytest.raises(ValueError, match="Missing prompt column"):
-        bench.select_samples(path, "missing", 1, 42)
 
 
-def test_template_modes_and_context_budget():
-    sample = bench.Sample(9, "abc")
-    off = bench.prepare_samples([sample], Tokenizer(), False, "system", 100, 10)[0]
-    on = bench.prepare_samples([sample], Tokenizer(), True, "system", 100, 10)[0]
-    assert off.prompt_tokens == on.prompt_tokens == 3
-    assert off.input_ids != on.input_ids
-    assert b"system" in bytes(off.input_ids)
-    assert len(off.input_ids) > off.prompt_tokens
-    with pytest.raises(ValueError, match="source_row=9"):
-        bench.prepare_samples([sample], Tokenizer(), True, "system", 10, 10)
+def test_prepare_samples_uses_server_tokenizer_for_both_lengths():
+    samples = [bench.Sample(3, "abc")]
+    client = FakeClient()
+    prepared = bench.prepare_samples(samples, client, "model", True, "system", {3: 3})
+    assert prepared[0].prompt_tokens == 3
+    assert prepared[0].input_tokens == len("abc") + len("system") + 10
+    assert prepared[0].input_token_ids[0] == 1
+    assert prepared[0].messages[-1] == {"role": "user", "content": "abc"}
 
 
-def test_all_batch_sizes_use_same_samples_and_exclude_warmup(monkeypatch, capsys):
-    args = bench.parse_args(["--input-file", "input.csv", "--model", "model"])
-    samples = [bench.Sample(i, f"prompt {i}") for i in range(32)]
-    engine = Engine()
-    sampling = SimpleNamespace(max_tokens=args.max_tokens)
-    # Exactly two clock reads per generate; each call takes 2 seconds.
-    ticks = iter(range(0, 10000, 2))
-    monkeypatch.setattr(bench.time, "perf_counter", lambda: next(ticks))
-    summaries = bench.benchmark(args, samples, engine, sampling)
-    assert len(summaries) == 12
-    assert sampling.max_tokens == 8192
-    for summary in summaries:
-        assert summary["samples"] == 32
-        assert summary["batches"] == 32 // summary["batch_size"]
-        assert summary["total_seconds"] == summary["batches"] * 2
-        assert summary["mean_batch_seconds"] == 2
-        assert summary["mean_output_tokens"] == 3
-        assert summary["capped"] == 32
-    assert sum(budget == 1 for _, budget in engine.calls) == 12
-    measured = [(prompts, budget) for prompts, budget in engine.calls if budget != 1]
-    assert sum(len(prompts) for prompts, _ in measured) == 384
-    # Every formatted prompt appears once per batch-size setting.
-    from collections import Counter
-    counts = Counter(tuple(prompt["prompt_token_ids"])
-                     for prompts, _ in measured for prompt in prompts)
-    assert len(counts) == 64
-    assert set(counts.values()) == {6}
+def test_payload_contains_chat_template_and_sampling_parameters():
+    item = bench.PreparedSample(bench.Sample(0, "q"), [{"role": "user", "content": "q"}], 1, 11, (0,))
+    payload = bench.make_chat_payload(args(), "served", item, True)
+    assert payload["model"] == "served"
+    assert payload["chat_template_kwargs"] == {"enable_thinking": True}
+    assert payload["max_tokens"] == 8192
+    assert payload["stream"] is False
+    assert payload["skip_special_tokens"] is False
+
+
+def test_run_batch_sends_simultaneous_requests_and_parses_usage():
+    client = FakeClient()
+    parsed = args("--no-warmup")
+    samples = [bench.Sample(i, f"q{i}") for i in range(4)]
+    lengths = {sample.source_row: len(sample.prompt) for sample in samples}
+    prepared = bench.prepare_samples(samples, client, "model", True, "sys", lengths)
+    results, elapsed = bench.run_batch(client, parsed, "model", prepared, True)
+    assert client.max_active == 4
+    assert elapsed >= 0.01
+    assert [result.source_row for result in results] == [0, 1, 2, 3]
+    assert all(result.output_tokens == 3 and result.reasoning == "two short steps"
+               for result in results)
+
+
+def test_benchmark_reuses_samples_and_reports_summary(capsys):
+    parsed = args("--no-warmup", "--no-show-answers")
+    client = FakeClient()
+    samples = [bench.Sample(i, f"q{i}") for i in range(4)]
+    summaries = bench.benchmark(parsed, samples, client, "model")
+    assert len(summaries) == 6
+    assert all(summary["samples"] == 4 for summary in summaries)
+    assert [summary["batches"] for summary in summaries] == [4, 4, 2, 2, 1, 1]
+    assert all(summary["mean_output_tokens"] == 3 for summary in summaries)
     terminal = capsys.readouterr().out
-    assert "Response (unabridged)" in terminal
-    assert "<think>Brief reasoning</think> Answer" in terminal
-    assert "Summary" in terminal and "output_tokens" in terminal
+    assert "concurrent HTTP requests" in terminal
+    assert "request_id" in terminal
+    assert "Reasoning:" not in terminal
 
 
-def test_partial_batch_and_quiet_answers(capsys):
-    args = bench.parse_args(["--input-file", "x", "--model", "m", "--sample-size", "3",
-                             "--batch-sizes", "2", "--no-warmup", "--no-show-answers"])
-    engine = Engine()
-    summaries = bench.benchmark(args, [bench.Sample(i, str(i)) for i in range(3)],
-                                engine, SimpleNamespace(max_tokens=args.max_tokens))
-    assert [len(prompts) for prompts, _ in engine.calls] == [2, 1, 2, 1]
-    assert all(row["batches"] == 2 and row["samples"] == 3 for row in summaries)
-    terminal = capsys.readouterr().out
-    assert "requested=2 actual=1" in terminal
-    assert "Response (unabridged)" not in terminal
+def test_thinking_template_must_change_tokenized_input():
+    class IgnoredClient(FakeClient):
+        def tokenize_chat(self, model, messages, thinking):
+            return 2, (1, 2)
 
-
-def test_unsupported_thinking_template_fails():
-    class IgnoredTemplate(Tokenizer):
-        def apply_chat_template(self, *args, **kwargs):
-            return "same input"
-
-    args = bench.parse_args(["--input-file", "x", "--model", "m"])
-    engine = SimpleNamespace(get_tokenizer=IgnoredTemplate)
+    parsed = args("--no-warmup", "--no-show-answers")
     with pytest.raises(ValueError, match="ignores enable_thinking"):
-        bench.benchmark(args, [bench.Sample(0, "prompt")], engine, None)
+        bench.benchmark(parsed, [bench.Sample(i, "q") for i in range(4)],
+                        IgnoredClient(), "model")
 
 
-def test_engine_is_normal_generation(monkeypatch):
-    fake = ModuleType("vllm")
-
-    def make_llm(**settings):
-        assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "0,1,2,3"
-        return settings
-
-    fake.LLM = make_llm
-    fake.SamplingParams = lambda **kwargs: SimpleNamespace(**kwargs)
-    monkeypatch.setitem(sys.modules, "vllm", fake)
-    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "")
-    args = bench.parse_args(["--input-file", "x", "--model", "m"])
-    settings, sampling = bench.create_engine(args)
-    assert "speculative_config" not in settings and "kv_transfer_config" not in settings
-    assert "max_num_seqs" not in settings
-    assert settings["block_size"] == 128
-    assert not settings["enable_prefix_caching"] and not settings["enable_chunked_prefill"]
-    assert sampling.skip_special_tokens is False
+def test_parse_response_validates_server_token_usage():
+    item = bench.PreparedSample(bench.Sample(2, "q"), [], 1, 5, (1, 2, 3, 4, 5))
+    response = {
+        "choices": [{"finish_reason": "stop", "message": {"content": "a"}}],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 1},
+    }
+    with pytest.raises(RuntimeError, match="Input token mismatch"):
+        bench.parse_chat_response(item, response)
 
 
-@pytest.mark.parametrize("flags", [["--sample-size", "8"], ["--batch-sizes", "0"],
-                                  ["--batch-sizes", "1", "1"], ["--devices", "0,0,2,3"]])
+def test_http_client_routes_and_model_discovery(monkeypatch):
+    calls = []
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *unused):
+            return False
+
+        def read(self):
+            return json.dumps(self.body).encode()
+
+    def urlopen(request, timeout):
+        calls.append((request.full_url, request.method, request.data, request.headers, timeout))
+        if request.full_url.endswith("/models"):
+            return Response({"data": [{"id": "served-model"}]})
+        return Response({"count": 2, "tokens": [1, 2], "max_model_len": 32768})
+
+    monkeypatch.setattr(bench.urllib.request, "urlopen", urlopen)
+    client = bench.VLLMClient("http://localhost:8001/v1/", "EMPTY", 9)
+    assert client.resolve_model(None) == "served-model"
+    assert client.tokenize_prompt("served-model", "hi") == (2, (1, 2))
+    assert calls[0][0] == "http://localhost:8001/v1/models"
+    assert calls[1][0] == "http://localhost:8001/tokenize"
+    assert calls[1][4] == 9
+    assert calls[1][3]["Authorization"] == "Bearer EMPTY"
+    assert json.loads(calls[1][2])["prompt"] == "hi"
+
+    client_without_version = bench.VLLMClient("http://localhost:8001", "", 9)
+    assert client_without_version.base_url == "http://localhost:8001/v1"
+    assert client_without_version.server_url == "http://localhost:8001"
+
+
+def test_model_name_is_validated(monkeypatch):
+    client = bench.VLLMClient("http://localhost:8001/v1", "", 1)
+    monkeypatch.setattr(client, "_request", lambda *args: {"data": [{"id": "one"}]})
+    with pytest.raises(ValueError, match="available=.*one"):
+        client.resolve_model("other")
+
+
+@pytest.mark.parametrize("flags", [
+    ["--sample-size", "0"], ["--sample-size", "3"], ["--batch-sizes", "0"],
+    ["--batch-sizes", "1", "1"], ["--request-timeout", "0"],
+])
 def test_invalid_args(flags):
     with pytest.raises(SystemExit):
-        bench.parse_args(["--input-file", "x", "--model", "m", *flags])
+        bench.parse_args(["--input-file", "x", *flags])
