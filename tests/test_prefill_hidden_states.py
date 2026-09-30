@@ -8,7 +8,7 @@ Inside a matching vLLM/Ascend environment, import the real runner:
     python tests/test_prefill_hidden_states.py --native-runner -v
     python tests/test_prefill_hidden_states.py --native-runner --device npu:0 -v
 
-The default CPU mode compiles the three production methods directly from the
+The default CPU mode compiles the tested production methods directly from the
 local source AST, without importing the NPU dependency tree. It does not copy
 their implementation. Native mode imports the class from the local checkout.
 Both modes bypass __init__ and mock scheduler/batch metadata and the upstream
@@ -20,14 +20,15 @@ not a four-rank end-to-end inference run. No model weights are required.
 
 import argparse
 import ast
-import hashlib
 import importlib
+import logging
+import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -49,7 +50,7 @@ def _load_isolated_runner():
         if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner"
     )
     method_names = {
-        "_plan_prefill_hidden_states", "_save_prefill_hidden_states", "_update_states"
+        "_prepare_prefill_output_dir", "_plan_prefill_hidden_states", "_save_prefill_hidden_states", "_update_states"
     }
     methods = [
         node for node in runner_node.body
@@ -75,7 +76,10 @@ def _load_isolated_runner():
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
-    namespace = {"torch": torch, "hashlib": hashlib, "StubGPUModelRunner": StubGPUModelRunner}
+    namespace = {
+        "torch": torch, "Path": Path, "shutil": shutil, "StubGPUModelRunner": StubGPUModelRunner,
+        "logger": logging.getLogger(__name__),
+    }
     exec(compile(module, str(source_path), "exec"), namespace)
     return namespace["NPUModelRunner"]
 
@@ -129,7 +133,7 @@ class TestPrefillHiddenStates(unittest.TestCase):
         self.runner._save_prefill_hidden_states(hidden_states, plan)
 
     def _path(self, req_id):
-        return self.output_dir / (hashlib.sha256(req_id.encode("utf-8")).hexdigest() + ".pt")
+        return self.output_dir / (req_id + ".pt")
 
     def _read(self, req_id):
         return torch.load(self._path(req_id), map_location="cpu", weights_only=True)
@@ -152,6 +156,46 @@ class TestPrefillHiddenStates(unittest.TestCase):
             runner_class = _load_isolated_runner()
         self.assertTrue(callable(runner_class._plan_prefill_hidden_states))
         self.assertTrue(callable(runner_class._save_prefill_hidden_states))
+
+    def test_before_forward_logs_prefill_ids_only(self):
+        """范围：Forward 前记录未完成和即将完成的 Prefill ID，不记录 Decode 或已保存请求。"""
+        scheduler = self._batch(
+            ["partial", "last", "decode", "saved"],
+            [6, 3, 2, 2], [2, 2, 4, 2], [0, 1, 5, 0],
+        )
+        self.runner._saved_prefill_request_ids.add("saved")
+        log = MagicMock()
+        with patch.dict(self.runner._plan_prefill_hidden_states.__func__.__globals__, {"logger": log}):
+            self.runner._plan_prefill_hidden_states(scheduler)
+        self.assertEqual(log.info.call_args_list, [
+            call("[prefill_hidden_states][before_forward] req_id=%s", "partial"),
+            call("[prefill_hidden_states][before_forward] req_id=%s", "last"),
+        ])
+        self.assertEqual(list(self.output_dir.iterdir()), [])
+
+    def test_saved_log_is_emitted_only_after_successful_file_creation(self):
+        """范围：保存日志仅在文件成功落盘后输出 ID，写盘失败不输出成功日志。"""
+        scheduler = self._batch(["success"], [2], [2], [0])
+        plan = self.runner._plan_prefill_hidden_states(scheduler)
+        log = MagicMock()
+
+        def check_saved_file(message, req_id):
+            self.assertEqual(message, "[prefill_hidden_states][saved] req_id=%s")
+            self.assertEqual(self._read(req_id)["request_id"], req_id)
+
+        log.info.side_effect = check_saved_file
+        with patch.dict(self.runner._save_prefill_hidden_states.__func__.__globals__, {"logger": log}):
+            self.runner._save_prefill_hidden_states(self._states(2), plan)
+        log.info.assert_called_once_with("[prefill_hidden_states][saved] req_id=%s", "success")
+
+        scheduler = self._batch(["failure"], [2], [2], [0])
+        plan = self.runner._plan_prefill_hidden_states(scheduler)
+        log.reset_mock()
+        with patch.dict(self.runner._save_prefill_hidden_states.__func__.__globals__, {"logger": log}):
+            with patch.object(torch, "save", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    self.runner._save_prefill_hidden_states(self._states(2), plan)
+        log.info.assert_not_called()
 
     def test_unchunked_prefill_exports_last_prompt_token_and_metadata(self):
         """范围：完整 Prefill 的末 token、文件元数据、向量维度与去重记录。"""
@@ -272,14 +316,52 @@ class TestPrefillHiddenStates(unittest.TestCase):
                 torch.testing.assert_close(feature, expected)
 
     def test_request_id_cannot_escape_output_directory(self):
-        """范围：含路径分隔符、绝对路径和 Unicode 的 ID 只生成输出目录内的哈希文件。"""
-        ids = ["../../escape", "C:\\outside\\file", "/tmp/outside", "请求/一"]
-        scheduler = self._batch(ids, [1] * 4, [1] * 4, [0] * 4)
-        self._export(scheduler, self._states(4))
-        self.assertEqual(len(list(self.output_dir.iterdir())), 4)
+        """范围：拒绝路径穿越和非法文件名 ID，不进行哈希或静默重命名。"""
+        ids = ["../../escape", "C:\\outside\\file", "/tmp/outside", "请求/一", "", ".", "..", "a:b"]
+        for req_id in ids:
+            with self.subTest(req_id=req_id):
+                scheduler = self._batch([req_id], [1], [1], [0])
+                with self.assertRaisesRegex(ValueError, "request_id"):
+                    self._export(scheduler, self._states(1))
+        self.assertEqual(list(self.output_dir.iterdir()), [])
+
+    def test_request_id_is_used_as_literal_filename(self):
+        """范围：普通及 Unicode ID 原样用于文件名，直接通过 request_id.pt 读取。"""
+        ids = ["chatcmpl-123", "请求一"]
+        scheduler = self._batch(ids, [1, 1], [1, 1], [0, 0])
+        self._export(scheduler, self._states(2))
+        self.assertEqual({path.name for path in self.output_dir.iterdir()}, {req_id + ".pt" for req_id in ids})
         for req_id in ids:
             self.assertEqual(self._read(req_id)["request_id"], req_id)
-            self.assertEqual(self._path(req_id).parent, self.output_dir)
+
+    def test_output_directory_is_created_without_extra_subdirectory(self):
+        """范围：配置目录不存在时创建该目录，不附加 UUID 子目录。"""
+        target = self.output_dir / "new" / "features"
+        result = self.runner._prepare_prefill_output_dir(str(target))
+        self.assertEqual(result, target.resolve())
+        self.assertTrue(target.is_dir())
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_existing_output_directory_is_emptied(self):
+        """范围：初始化清空旧文件、隐藏文件及嵌套目录，保留输出目录和外部文件。"""
+        target = self.output_dir / "features"
+        (target / "old_session").mkdir(parents=True)
+        (target / "old.pt").write_bytes(b"old")
+        (target / ".hidden").write_bytes(b"old")
+        (target / "old_session" / "nested.pt").write_bytes(b"old")
+        outside = self.output_dir / "keep.pt"
+        outside.write_bytes(b"keep")
+        result = self.runner._prepare_prefill_output_dir(str(target))
+        self.assertEqual(result, target.resolve())
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(outside.read_bytes(), b"keep")
+
+    def test_protected_output_directories_are_rejected_before_deletion(self):
+        """范围：拒绝根目录、用户目录、工作目录及其祖先，保护误配置路径。"""
+        for target in (Path.cwd(), Path.cwd().parent, Path.home(), Path(Path.cwd().anchor)):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(ValueError, "protected"):
+                    self.runner._prepare_prefill_output_dir(str(target))
 
     def test_write_failure_cleans_temporary_file_and_allows_retry(self):
         """范围：写盘失败向上传播、清理半成品、不标记已保存，并允许同请求重试。"""
