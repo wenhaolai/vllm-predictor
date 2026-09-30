@@ -32,7 +32,8 @@ from unittest.mock import patch
 import torch
 
 
-def _runner_source_path():
+def _runner_source_path() -> str | Path:
+    """允许直接返回服务器文件路径字符串；调用处统一转换为 Path。"""
     return (
         Path(__file__).resolve().parents[1]
         / "vllm-ascend/vllm_ascend/worker/model_runner_v1.py"
@@ -41,7 +42,7 @@ def _runner_source_path():
 
 def _load_isolated_runner():
     """Compile unchanged production methods, stubbing only their parent class."""
-    source_path = _runner_source_path()
+    source_path = Path(_runner_source_path()).resolve()
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     runner_node = next(
         node for node in tree.body
@@ -89,10 +90,11 @@ class TestPrefillHiddenStates(unittest.TestCase):
             importlib.import_module("torch_npu")
             torch.npu.set_device(cls.test_device)
         if cls.native_runner:
-            checkout = _runner_source_path().parents[2]
+            source_path = Path(_runner_source_path()).resolve()
+            checkout = source_path.parents[2]
             sys.path.insert(0, str(checkout))
             module = importlib.import_module("vllm_ascend.worker.model_runner_v1")
-            if Path(module.__file__).resolve() != _runner_source_path().resolve():
+            if Path(module.__file__).resolve() != source_path:
                 raise RuntimeError("Native mode imported a different checkout of model_runner_v1")
             cls.runner_class = module.NPUModelRunner
         else:
@@ -139,6 +141,17 @@ class TestPrefillHiddenStates(unittest.TestCase):
         self.assertEqual(plan, [])
         self.runner._save_prefill_hidden_states(None, plan)
         self.assertEqual(list(self.output_dir.iterdir()), [])
+
+    def test_source_loader_accepts_string_path(self):
+        """范围：源码路径被配置为 str 时，仍能转成 Path 并加载生产方法。"""
+        source_path = str(_runner_source_path())
+        with patch.dict(
+            _load_isolated_runner.__globals__,
+            {"_runner_source_path": lambda: source_path},
+        ):
+            runner_class = _load_isolated_runner()
+        self.assertTrue(callable(runner_class._plan_prefill_hidden_states))
+        self.assertTrue(callable(runner_class._save_prefill_hidden_states))
 
     def test_unchunked_prefill_exports_last_prompt_token_and_metadata(self):
         """范围：完整 Prefill 的末 token、文件元数据、向量维度与去重记录。"""
