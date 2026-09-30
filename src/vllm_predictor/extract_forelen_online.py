@@ -11,19 +11,21 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import time
+import threading
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
-from typing import Iterable, Iterator, TypeVar
+from typing import Any, Iterable, Iterator, Sequence, TypeVar
 
 import torch
 from safetensors.torch import save_file
-
-from .chat_benchmark import (
-    DEFAULT_SYSTEM_PROMPT, Sample, VLLMClient, prepare_samples, run_batch,
-)
 
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -32,6 +34,211 @@ CSV_FIELDS = (
     "prompt_length", "input_tokens", "output_tokens", "finish_reason",
     "thinking", "model", "hidden_states_path", "hidden_states_key", "hidden_states_row",
 )
+
+
+DEFAULT_SYSTEM_PROMPT = (
+    "Provide a concise solution in 2-4 key steps, then give the final answer. "
+    "Use fewer steps for simple questions. Keep each step to 1-2 sentences. "
+    "Include only essential facts, formulas, calculations or justification. "
+    "For multiple-choice questions, explain the basis for the selected option. "
+    "Do not restate the question, repeat explanations, or list alternative solutions. "
+    "Use the same language as the question."
+)
+
+
+@dataclass(frozen=True)
+class Sample:
+    source_row: int
+    prompt: str
+
+
+@dataclass(frozen=True)
+class PreparedSample:
+    sample: Sample
+    messages: list[dict[str, str]]
+    prompt_tokens: int
+    input_tokens: int
+    input_token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class Result:
+    source_row: int
+    prompt_tokens: int
+    input_tokens: int
+    output_tokens: int
+    finish_reason: str
+    request_id: str
+
+
+class VLLMClient:
+    """Small dependency-free client for the vLLM OpenAI-compatible server."""
+
+    def __init__(self, base_url: str, api_key: str, timeout: float) -> None:
+        supplied_url = base_url.rstrip("/")
+        self.server_url = supplied_url[:-3] if supplied_url.endswith("/v1") else supplied_url
+        self.base_url = f"{self.server_url}/v1"
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def _request(self, url: str, method: str = "GET",
+                 payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {"Accept": "application/json"}
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"vLLM request failed: {method} {url} HTTP {error.code}: {detail[:2000]}") from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"Cannot reach vLLM server at {url}: {error.reason}") from error
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Expected JSON object from {url}, got {type(result).__name__}")
+        if "error" in result:
+            raise RuntimeError(f"vLLM returned an error from {url}: {result['error']}")
+        return result
+
+    def resolve_model(self, requested_model: str | None) -> str:
+        response = self._request(f"{self.base_url}/models")
+        models = [item.get("id") for item in response.get("data", [])
+                  if isinstance(item, dict) and item.get("id")]
+        if not models:
+            raise RuntimeError(f"No served model reported by {self.base_url}/models")
+        if requested_model is None:
+            return str(models[0])
+        if requested_model not in models:
+            raise ValueError(
+                f"Model {requested_model!r} is not served by {self.base_url}; available={models}")
+        return requested_model
+
+    def tokenize_prompt(self, model: str, prompt: str) -> tuple[int, tuple[int, ...]]:
+        response = self._request(
+            f"{self.server_url}/tokenize", "POST",
+            {"model": model, "prompt": prompt, "add_special_tokens": False},
+        )
+        return _parse_tokenize_response(response)
+
+    def tokenize_chat(self, model: str, messages: list[dict[str, str]],
+                      thinking: bool) -> tuple[int, tuple[int, ...]]:
+        response = self._request(
+            f"{self.server_url}/tokenize", "POST",
+            {
+                "model": model,
+                "messages": messages,
+                "add_generation_prompt": True,
+                "chat_template_kwargs": {"enable_thinking": thinking},
+            },
+        )
+        return _parse_tokenize_response(response)
+
+    def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request(f"{self.base_url}/chat/completions", "POST", payload)
+
+
+def _parse_tokenize_response(response: dict[str, Any]) -> tuple[int, tuple[int, ...]]:
+    tokens = response.get("tokens")
+    count = response.get("count")
+    if not isinstance(tokens, list) or not all(isinstance(token, int) for token in tokens):
+        raise RuntimeError(f"Invalid /tokenize tokens: {tokens!r}")
+    if not isinstance(count, int) or count != len(tokens):
+        raise RuntimeError(f"Invalid /tokenize count={count!r}, token_count={len(tokens)}")
+    return count, tuple(tokens)
+
+
+def _messages(sample: Sample, system_prompt: str) -> list[dict[str, str]]:
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": sample.prompt})
+    return messages
+
+
+def prepare_samples(samples: Sequence[Sample], client: VLLMClient, model: str,
+                    thinking: bool, system_prompt: str,
+                    prompt_lengths: dict[int, int]) -> list[PreparedSample]:
+    prepared = []
+    for sample in samples:
+        messages = _messages(sample, system_prompt)
+        input_count, input_ids = client.tokenize_chat(model, messages, thinking)
+        prepared.append(PreparedSample(
+            sample, messages, prompt_lengths[sample.source_row], input_count, input_ids))
+    return prepared
+
+
+def make_chat_payload(args: argparse.Namespace, model: str,
+                      item: PreparedSample, thinking: bool,
+                      max_tokens: int | None = None) -> dict[str, Any]:
+    return {
+        "model": model,
+        "messages": item.messages,
+        "chat_template_kwargs": {"enable_thinking": thinking},
+        "max_tokens": args.max_tokens if max_tokens is None else max_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+        "presence_penalty": args.presence_penalty,
+        "frequency_penalty": args.frequency_penalty,
+        "repetition_penalty": args.repetition_penalty,
+        "seed": args.seed,
+        "skip_special_tokens": False,
+        "stream": False,
+    }
+
+
+def parse_chat_response(item: PreparedSample, response: dict[str, Any]) -> Result:
+    choices = response.get("choices")
+    usage = response.get("usage")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(usage, dict):
+        raise RuntimeError(f"Invalid chat completion response: {response}")
+    choice = choices[0]
+    message = choice.get("message") if isinstance(choice, dict) else None
+    prompt_tokens = usage.get("prompt_tokens")
+    output_tokens = usage.get("completion_tokens")
+    if not isinstance(message, dict) or not isinstance(prompt_tokens, int) or not isinstance(output_tokens, int):
+        raise RuntimeError(f"Missing message or token usage in response: {response}")
+    if prompt_tokens != item.input_tokens:
+        raise RuntimeError(
+            f"Input token mismatch for source_row={item.sample.source_row}: "
+            f"/tokenize={item.input_tokens}, completion usage={prompt_tokens}")
+    finish_reason = choice.get("finish_reason")
+    if not isinstance(finish_reason, str):
+        raise RuntimeError(f"Missing finish_reason in response: {response}")
+    return Result(
+        source_row=item.sample.source_row,
+        prompt_tokens=item.prompt_tokens,
+        input_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        finish_reason=finish_reason,
+        request_id=str(response.get("id", "")),
+    )
+
+
+def run_batch(client: VLLMClient, args: argparse.Namespace, model: str,
+              batch: Sequence[PreparedSample], thinking: bool,
+              max_tokens: int | None = None) -> tuple[list[Result], float]:
+    """Release N HTTP calls together so vLLM can continuously batch them."""
+    barrier = threading.Barrier(len(batch) + 1)
+
+    def request_one(item: PreparedSample) -> Result:
+        payload = make_chat_payload(args, model, item, thinking, max_tokens)
+        barrier.wait()
+        return parse_chat_response(item, client.chat(payload))
+
+    with ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix="vllm-request") as pool:
+        futures = [pool.submit(request_one, item) for item in batch]
+        started = time.perf_counter()
+        barrier.wait()
+        results = [future.result() for future in futures]
+        elapsed = time.perf_counter() - started
+    return results, elapsed
 
 
 def parse_args(argv=None):

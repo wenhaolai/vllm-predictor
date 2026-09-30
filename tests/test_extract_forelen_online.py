@@ -1,6 +1,8 @@
 """Online extraction tests using real .pt/safetensors files and a fake HTTP client."""
 
 import csv
+import io
+import json
 import sys
 import threading
 import time
@@ -181,3 +183,59 @@ def test_nonempty_and_nested_output_directories_are_rejected(tmp_path):
     args.output_dir = args.hidden_states_dir / "output"
     with pytest.raises(ValueError, match="separate"):
         online.extract(args, client)
+
+
+def test_integrated_http_client_routes_and_thinking(monkeypatch):
+    """范围：整合后的客户端独立处理模型发现、URL、认证、分词、thinking 和聊天请求。"""
+    calls = []
+
+    def urlopen(request, timeout):
+        payload = json.loads(request.data) if request.data else None
+        calls.append((request.full_url, request.method, payload, request.headers, timeout))
+        if request.full_url.endswith("/models"):
+            body = {"data": [{"id": "served"}]}
+        elif request.full_url.endswith("/tokenize"):
+            body = {"count": 2, "tokens": [1, 2]}
+        else:
+            body = {"id": "chat-request"}
+        return io.BytesIO(json.dumps(body).encode())
+
+    monkeypatch.setattr(online.urllib.request, "urlopen", urlopen)
+    client = online.VLLMClient("http://localhost:8001/v1/", "key", 9)
+    assert client.resolve_model(None) == "served"
+    assert client.tokenize_prompt("served", "q") == (2, (1, 2))
+    messages = [{"role": "user", "content": "q"}]
+    assert client.tokenize_chat("served", messages, True) == (2, (1, 2))
+    assert client.chat({"model": "served", "messages": messages}) == {"id": "chat-request"}
+    assert [call[0] for call in calls] == [
+        "http://localhost:8001/v1/models", "http://localhost:8001/tokenize",
+        "http://localhost:8001/tokenize", "http://localhost:8001/v1/chat/completions",
+    ]
+    assert calls[1][2]["add_special_tokens"] is False
+    assert calls[2][2]["chat_template_kwargs"] == {"enable_thinking": True}
+    assert calls[0][3]["Authorization"] == "Bearer key"
+    assert all(call[4] == 9 for call in calls)
+    assert online.VLLMClient("http://localhost:8001", "", 9).base_url == client.base_url
+    with pytest.raises(ValueError, match="not served"):
+        client.resolve_model("unknown")
+
+
+def test_integrated_response_parser_checks_input_length():
+    """范围：整合后的响应解析器拒绝 usage 与分词计数不一致，并保留输出长度和 ID。"""
+    item = online.PreparedSample(online.Sample(4, "q"), [], 1, 2, (1, 2))
+    response = {"id": "req", "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 8}}
+    with pytest.raises(RuntimeError, match="Input token mismatch"):
+        online.parse_chat_response(item, response)
+    response["usage"]["prompt_tokens"] = 2
+    result = online.parse_chat_response(item, response)
+    assert (result.source_row, result.request_id, result.output_tokens) == (4, "req", 8)
+
+
+def test_integrated_http_client_reports_server_errors(monkeypatch):
+    """范围：整合后的 HTTP 客户端保留服务错误信息，拒绝非 JSON 对象响应。"""
+    client = online.VLLMClient("http://localhost:8001", "", 1)
+    for body, expected in [({"error": "bad request"}, "bad request"), ([], "Expected JSON object")]:
+        monkeypatch.setattr(online.urllib.request, "urlopen", lambda *a, **kw: io.BytesIO(json.dumps(body).encode()))
+        with pytest.raises(RuntimeError, match=expected):
+            client.chat({})
